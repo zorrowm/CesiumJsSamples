@@ -1,12 +1,13 @@
 import Trail from "./Trail.js";
 
-const { Cartesian2, DebugModelMatrixPrimitive } = window.Cesium;
+const { DebugModelMatrixPrimitive, TileMapServiceImageryProvider } = window.Cesium;
 
 const viewer = new Cesium.Viewer("cesiumContainer", {
     infoBox: false, //Disable InfoBox widget
     selectionIndicator: false, //Disable selection indicator
     shouldAnimate: true, // Enable animations
-    terrain: Cesium.Terrain.fromWorldTerrain()
+    terrain: Cesium.Terrain.fromWorldTerrain(),
+    scene3DOnly: true
 });
 
 //Enable lighting based on the sun position
@@ -62,6 +63,7 @@ const position = computeCirclularFlight(-112.110693, 36.0994841, 0.03);
 
 //Actually create the entity
 const planeEntity = viewer.entities.add({
+    show: true,
     //Set the entity availability to the same interval as the simulation time.
     availability: new Cesium.TimeIntervalCollection([
         new Cesium.TimeInterval({
@@ -79,91 +81,22 @@ const planeEntity = viewer.entities.add({
     //Load the Cesium plane model to represent the entity
     model: {
         uri: "./assets/models/Cesium_Air.glb",
-        minimumPixelSize: 64
-    }
+        minimumPixelSize: 1,
+        scale: 1
+    },
 
     //Show the path as a pink line sampled in 1 second increments.
-    /*
+
     path: {
-        resolution: 1,
-        material: new Cesium.PolylineGlowMaterialProperty({
-            glowPower: 0.1,
-            color: Cesium.Color.YELLOW
-        }),
-        width: 10
+        width: 1
     }
-    */
 });
 
-//Add button to view the path from the top down
-Sandcastle.addDefaultToolbarButton("View Top Down", function () {
-    viewer.trackedEntity = undefined;
-    viewer.zoomTo(viewer.entities, new Cesium.HeadingPitchRange(0, Cesium.Math.toRadians(-90)));
-});
-
-//Add button to view the path from the side
-Sandcastle.addToolbarButton("View Side", function () {
-    viewer.trackedEntity = undefined;
-    viewer.zoomTo(viewer.entities, new Cesium.HeadingPitchRange(Cesium.Math.toRadians(-90), Cesium.Math.toRadians(-15), 7500));
-});
-
-//Add button to track the entity as it moves
-Sandcastle.addToolbarButton("View Aircraft", function () {
-    viewer.trackedEntity = planeEntity;
-});
-
-Sandcastle.addToolbarMenu([
-    {
-        text: "Tracking reference frame: East-North-Up",
-        onselect: function () {
-            planeEntity.trackingReferenceFrame = Cesium.TrackingReferenceFrame.ENU;
-        }
-    },
-    {
-        text: "Tracking reference frame: Inertial",
-        onselect: function () {
-            planeEntity.trackingReferenceFrame = Cesium.TrackingReferenceFrame.INERTIAL;
-        }
-    }
-]);
-
-//Add a combo box for selecting each interpolation mode.
-Sandcastle.addToolbarMenu(
-    [
-        {
-            text: "Interpolation: Linear Approximation",
-            onselect: function () {
-                planeEntity.position.setInterpolationOptions({
-                    interpolationDegree: 1,
-                    interpolationAlgorithm: Cesium.LinearApproximation
-                });
-            }
-        },
-        {
-            text: "Interpolation: Lagrange Polynomial Approximation",
-            onselect: function () {
-                planeEntity.position.setInterpolationOptions({
-                    interpolationDegree: 5,
-                    interpolationAlgorithm: Cesium.LagrangePolynomialApproximation
-                });
-            }
-        },
-        {
-            text: "Interpolation: Hermite Polynomial Approximation",
-            onselect: function () {
-                planeEntity.position.setInterpolationOptions({
-                    interpolationDegree: 2,
-                    interpolationAlgorithm: Cesium.HermitePolynomialApproximation
-                });
-            }
-        }
-    ],
-    "interpolationMenu"
-);
+viewer.trackedEntity = planeEntity;
 
 const scene = viewer.scene;
 
-const trail = new Trail(scene);
+const trail = new Trail(scene, planeEntity, viewer.clock);
 scene.primitives.add(trail);
 
 const debugModelMatrixPrimitive = new DebugModelMatrixPrimitive({
@@ -173,44 +106,10 @@ const debugModelMatrixPrimitive = new DebugModelMatrixPrimitive({
 
 scene.primitives.add(debugModelMatrixPrimitive);
 
-let previousTime = Cesium.JulianDate.clone(viewer.clock.currentTime);
-let previousPlanePosition = planeEntity.position.getValue(viewer.clock.currentTime);
-
 viewer.clock.onTick.addEventListener((e) => {
-    if (!Cesium.JulianDate.equalsEpsilon(previousTime, viewer.clock.currentTime, 1)) {
-        trail.updateTimestamp(viewer.clock.currentTime);
+    const time = viewer.clock.currentTime;
 
-        previousTime = Cesium.JulianDate.clone(viewer.clock.currentTime);
-    }
-
-    const planePosition = planeEntity.position.getValue(viewer.clock.currentTime);
-    const distance = Cesium.Cartesian3.distance(previousPlanePosition, planePosition);
-
-    const distanceTolerance = 100;
-
-    if (distance > distanceTolerance) {
-        //  trail.updatePosition(planePosition);
-        // previousPlanePosition = planePosition;
-    }
-});
-
-function computeModelMatrix(entity, time) {
-    return entity.computeModelMatrix(time, new Cesium.Matrix4());
-}
-
-viewer.scene.preUpdate.addEventListener(function (scene, time) {
-    const modelMatrix = computeModelMatrix(planeEntity, time);
+    const modelMatrix = planeEntity.computeModelMatrix(time, new Cesium.Matrix4());
 
     debugModelMatrixPrimitive.modelMatrix = modelMatrix;
-
-    const planePosition = planeEntity.position.getValue(viewer.clock.currentTime);
-    const distance = Cesium.Cartesian3.distance(previousPlanePosition, planePosition);
-
-    const distanceTolerance = 20;
-
-    if (distance > distanceTolerance) {
-        previousPlanePosition = planePosition;
-    }
-
-    trail.updatePosition(modelMatrix);
 });

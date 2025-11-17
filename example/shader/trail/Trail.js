@@ -1,62 +1,208 @@
-const { BlendingState, Cartesian3, DrawCommand, Geometry, GeometryAttribute, Matrix4, Pass, PrimitiveType, RenderState, ShaderProgram, VertexArray, Viewer } = Cesium;
+const {
+    BlendingState,
+    BoundingSphere,
+    Cartesian2,
+    Cartesian3,
+    DrawCommand,
+    EllipsoidGeodesic,
+    Event,
+    Geometry,
+    GeometryAttribute,
+    JulianDate,
+    Matrix4,
+    Pass,
+    PrimitiveType,
+    RenderState,
+    ShaderProgram,
+    VertexArray
+} = Cesium;
 
-const UPDATE_COUNT_OF_PARTICLE_COUNT = 1000;
+import vs from "./vs.js";
+import fs from "./fs.js";
+
 const POSITION_ATTRIBUTE_COUNT = 3;
-const MOUSE_ATTRIBUTE_COUNT = 4;
+const RANDOM_ATTRIBUTE_COUNT = 4;
+
 const scratchStep = new Cartesian3();
+const scratchSubPosition = new Cartesian3();
+const scratchWorldPosition = new Cartesian3();
+const scratchLocal = new Cartesian3();
+
+const geodesic = new EllipsoidGeodesic();
 
 class Trail {
-    constructor(scene) {
+    constructor(scene, entity, clock) {
         this._scene = scene;
+        this._entity = entity;
+        this._clock = clock;
 
-        this._totalParticleCount = UPDATE_COUNT_OF_PARTICLE_COUNT * 30;
+        this._countOfTrailSegments = 0; // Initial value, will be updated dynamically
+        this._countOfParticlePerTrailSegment = 800;
 
-        const count = this._totalParticleCount;
-
-        this._positions = new Float32Array(count * POSITION_ATTRIBUTE_COUNT);
-        this._mouse = new Float32Array(count * MOUSE_ATTRIBUTE_COUNT);
-        this._afront = new Float32Array(count * 2);
-        this._random = new Float32Array(count);
-
-        const positions = this._positions;
-        const mouse = this._mouse;
-        const aFront = this._afront;
-
-        this._positionIndex = 0;
-        this._mouseIndex = 0;
-
-        for (let i = 0; i < count; i++) {
-            positions[i * 3 + 0] = 0;
-            positions[i * 3 + 1] = 0;
-            positions[i * 3 + 2] = 0;
-
-            mouse[i * 4 + 0] = -1;
-            mouse[i * 4 + 1] = Math.random();
-            mouse[i * 4 + 2] = Math.random();
-            mouse[i * 4 + 3] = Math.random();
-
-            aFront[i * 2 + 0] = 0;
-            aFront[i * 2 + 1] = 0;
-
-            this._random[i] = Math.random();
-        }
-
-        this._timestamp = 0; // JulianDate.secondsOfDay
+        this._sysTimestamp = 0; // JulianDate.secondsOfDay
         this._oldPosition = null;
         this._modelMatrix = new Matrix4();
         this._inverseModelMatrix = new Matrix4();
+        this._pixelSize = 0;
+
+        this._averageTickDistance = 0;
+        this._averageTickTime = 0;
+        this._averageFrameRate = 0;
+
+        this._tickDistanceSum = 0;
+        this._tickTimeSum = 0;
+
+        this._tickCount = 0;
+
+        this._calibrateEnded = new Event();
+
+        this._update = false;
+        this._calibrating = false;
+
+        setTimeout(() => {
+            this._calibrate();
+        }, 3000);
+
+        let wheelEventEndTimeout = null;
+        const debounceDelay = 150;
+
+        scene.canvas.addEventListener("wheel", (e) => {
+            e.preventDefault();
+
+            // Clear any existing timeout to reset the "end" detection
+            clearTimeout(wheelEventEndTimeout);
+
+            // Set a new timeout to detect the end of the wheel event
+            wheelEventEndTimeout = setTimeout(() => {
+                // Log wheel data or manipulate the camera
+                console.log("Wheel event detected:");
+
+                if (this._calibrating) {
+                    console.warn("Currently calibrating, skipping recalibration.");
+                } else {
+                    this._calibrate();
+                }
+            }, debounceDelay);
+        });
+
+        this._calibrateEnded.addEventListener(() => {
+            this._createBuffers();
+        });
+
+        clock.onTick.addEventListener((e) => {
+            const time = clock.currentTime;
+
+            this._sysTimestamp = time.secondsOfDay;
+
+            this._entity.computeModelMatrix(time, this._modelMatrix);
+            Matrix4.inverse(this._modelMatrix, this._inverseModelMatrix);
+
+            if (this._countOfTrailSegments > 0) {
+                this._update = true;
+            }
+        });
+    }
+
+    _determineCountOfTrailSegments() {
+        const scene = this._scene;
+        const camera = scene.camera;
+        const clock = this._clock;
+        const position = this._entity.position.getValue(clock.currentTime);
+
+        const boundingSphere = new BoundingSphere(position, this._averageTickDistance);
+        const metersPerPixel = camera.getPixelSize(boundingSphere, scene.drawingBufferWidth, scene.drawingBufferHeight);
+
+        const desiredPixelSizeOfTrail = 300;
+        const pixelSizeOfTrailSegment = this._averageTickDistance / metersPerPixel;
+        this._countOfTrailSegments = Math.ceil(desiredPixelSizeOfTrail / pixelSizeOfTrailSegment);
+    }
+
+    _calibrate() {
+        this._calibrating = true;
+        this._tickDistanceSum = 0;
+        this._tickTimeSum = 0;
+        this._tickCount = 0;
+
+        const tickCountWindow = 10;
+
+        const clock = this._clock;
+        let previousTime = JulianDate.clone(clock.currentTime);
+        let previousPosition = this._entity.position.getValue(clock.currentTime);
+
+        const removeCallback = clock.onTick.addEventListener((e) => {
+            const time = clock.currentTime;
+
+            const tickTime = time.secondsOfDay - previousTime.secondsOfDay;
+            const tickDistance = Cartesian3.distance(this._entity.position.getValue(time), previousPosition);
+
+            const frameRate = 1.0 / tickTime;
+
+            if (frameRate < 10) {
+                previousTime = JulianDate.clone(clock.currentTime);
+                previousPosition = this._entity.position.getValue(clock.currentTime);
+                console.warn("Low frame rate detected:", frameRate);
+                return;
+            }
+
+            // Update running sums and count for moving average
+            this._tickDistanceSum += tickDistance;
+            this._tickTimeSum += tickTime;
+            this._tickCount++;
+            console.log(this._tickCount, tickDistance, tickTime, frameRate);
+
+            if (this._tickCount === tickCountWindow) {
+                this._averageTickDistance = this._tickDistanceSum / this._tickCount;
+                this._averageTickTime = this._tickTimeSum / this._tickCount;
+
+                this._determineCountOfTrailSegments();
+
+                this._calibrateEnded.raiseEvent();
+
+                console.log("Calibration ended:");
+                console.log("Average Tick Distance:", this._averageTickDistance);
+                console.log("Average Tick Time:", this._averageTickTime);
+                console.log("Count of Trail Segments:", this._countOfTrailSegments);
+
+                this._calibrating = false;
+                removeCallback();
+            }
+
+            if (this._tickCount > tickCountWindow) {
+                throw new Error("This should not happen");
+            }
+
+            previousTime = JulianDate.clone(clock.currentTime);
+            previousPosition = this._entity.position.getValue(clock.currentTime);
+        });
+    }
+
+    _createBuffers() {
+        const totalParticleCount = this._countOfParticlePerTrailSegment * this._countOfTrailSegments;
+
+        this._positions = new Float32Array(totalParticleCount * POSITION_ATTRIBUTE_COUNT);
+        this._worldPositions = new Float32Array(totalParticleCount * POSITION_ATTRIBUTE_COUNT);
+        this._random = new Float32Array(totalParticleCount * RANDOM_ATTRIBUTE_COUNT);
+        this._timestamp = new Float32Array(totalParticleCount);
+
+        const random = this._random;
+
+        for (let i = 0; i < totalParticleCount; i++) {
+            random[i * 4 + 0] = Math.random();
+            random[i * 4 + 1] = Math.random();
+            random[i * 4 + 2] = Math.random();
+            random[i * 4 + 3] = Math.random();
+        }
+
+        this._positionIndex = 0;
+        this._timestampIndex = 0;
     }
 
     isDestroyed() {
         return false;
     }
 
-    _createVertexArray(modelMatrix) {
-        Matrix4.clone(modelMatrix, this._modelMatrix);
-
-        Matrix4.inverse(modelMatrix, this._inverseModelMatrix);
-
-        const position = Matrix4.getTranslation(modelMatrix, new Cartesian3());
+    _createVertexArray() {
+        const position = Matrix4.getTranslation(this._modelMatrix, new Cartesian3());
 
         const diff = new Cartesian3();
 
@@ -64,33 +210,48 @@ class Trail {
             Cartesian3.subtract(position, this._oldPosition, diff);
         }
 
-        const totalParticleCount = this._totalParticleCount;
+        const totalParticleCount = this._countOfParticlePerTrailSegment * this._countOfTrailSegments;
 
-        for (let i = 0; i < UPDATE_COUNT_OF_PARTICLE_COUNT; i++) {
+        for (let i = 0; i < this._countOfParticlePerTrailSegment; i++) {
             const ci = (this._positionIndex % (totalParticleCount * POSITION_ATTRIBUTE_COUNT)) + i * POSITION_ATTRIBUTE_COUNT;
 
             let subPosition = position;
 
             if (this._oldPosition) {
-                const step = Cartesian3.multiplyByScalar(diff, i / UPDATE_COUNT_OF_PARTICLE_COUNT, scratchStep);
+                const step = Cartesian3.multiplyByScalar(diff, i / this._countOfParticlePerTrailSegment, scratchStep);
 
-                subPosition = Cartesian3.add(this._oldPosition, step, position);
+                subPosition = Cartesian3.add(this._oldPosition, step, scratchSubPosition);
             }
 
-            this._positions[ci + 0] = subPosition.x;
-            this._positions[ci + 1] = subPosition.y;
-            this._positions[ci + 2] = subPosition.z;
+            this._worldPositions[ci + 0] = subPosition.x;
+            this._worldPositions[ci + 1] = subPosition.y;
+            this._worldPositions[ci + 2] = subPosition.z;
         }
 
-        for (let i = 0; i < UPDATE_COUNT_OF_PARTICLE_COUNT; i++) {
-            const ci = (this._mouseIndex % (totalParticleCount * MOUSE_ATTRIBUTE_COUNT)) + i * MOUSE_ATTRIBUTE_COUNT;
+        for (let i = 0; i < totalParticleCount * POSITION_ATTRIBUTE_COUNT; i += POSITION_ATTRIBUTE_COUNT) {
+            const worldPosition = scratchWorldPosition;
 
-            this._mouse[ci + 0] = this._timestamp;
+            worldPosition.x = this._worldPositions[i + 0];
+            worldPosition.y = this._worldPositions[i + 1];
+            worldPosition.z = this._worldPositions[i + 2];
+
+            const local = Matrix4.multiplyByPoint(this._inverseModelMatrix, worldPosition, scratchLocal);
+
+            this._positions[i + 0] = local.x - 13;
+            this._positions[i + 1] = local.y;
+            this._positions[i + 2] = local.z;
+        }
+
+        for (let i = 0; i < this._countOfParticlePerTrailSegment; i++) {
+            const ci = (this._timestampIndex % totalParticleCount) + i * 1;
+
+            this._timestamp[ci + 0] = this._sysTimestamp;
         }
 
         this._oldPosition = position;
-        this._positionIndex += POSITION_ATTRIBUTE_COUNT * UPDATE_COUNT_OF_PARTICLE_COUNT;
-        this._mouseIndex += MOUSE_ATTRIBUTE_COUNT * UPDATE_COUNT_OF_PARTICLE_COUNT;
+        this._positionIndex += POSITION_ATTRIBUTE_COUNT * this._countOfParticlePerTrailSegment;
+
+        this._timestampIndex += 1 * this._countOfParticlePerTrailSegment;
 
         const geometry = new Geometry({
             attributes: {
@@ -99,20 +260,15 @@ class Trail {
                     componentsPerAttribute: 3,
                     values: this._positions
                 }),
-                mouse: new GeometryAttribute({
-                    componentDatatype: Cesium.ComponentDatatype.FLOAT,
-                    componentsPerAttribute: 4,
-                    values: this._mouse
-                }),
-                aFront: new GeometryAttribute({
-                    componentDatatype: Cesium.ComponentDatatype.FLOAT,
-                    componentsPerAttribute: 2,
-                    values: this._afront
-                }),
                 random: new GeometryAttribute({
                     componentDatatype: Cesium.ComponentDatatype.FLOAT,
-                    componentsPerAttribute: 1,
+                    componentsPerAttribute: 4,
                     values: this._random
+                }),
+                timestamp: new GeometryAttribute({
+                    componentDatatype: Cesium.ComponentDatatype.FLOAT,
+                    componentsPerAttribute: 1,
+                    values: this._timestamp
                 })
             },
             primitiveType: PrimitiveType.POINTS
@@ -123,174 +279,21 @@ class Trail {
             geometry: geometry,
             attributeLocations: {
                 position: 0,
-                mouse: 1,
-                aFront: 2,
-                random: 3
+                random: 1,
+                timestamp: 2
             }
         });
     }
 
     _createDrawCommand(vertexArray) {
-        const vs = `
-                        precision highp float;
-                        precision highp int;
-
-                        in vec3 position;
-                        in vec4 mouse;
-                        in vec2 aFront;
-                        in float random;
-                     
-                        uniform float pixelRatio;
-                        uniform float timestamp;
-                        uniform float size;
-                        uniform float minSize;
-                        uniform float speed;
-                        uniform float far;
-                        uniform float spread;
-                        uniform float maxSpread;
-                        uniform float maxZ;
-                        uniform float maxDiff;
-                        uniform float diffPow;
-                        uniform mat4 modelMatrix;
-                        uniform mat4 inverseModelMatrix;
-
-                        out float vProgress;
-                        out float vRandom;
-                        out float vDiff;
-                        out float vSpreadLength;
-                        out float vPositionZ;
-
-                        const float PI = 3.1415926;
-                        const float PI2 = PI * 2.0;
-
-                        float cubicOut(float t) {
-                            float f = t - 1.0;
-
-                            return f * f * f + 1.0;
-                        }
-
-                        void main() {
-                            if(position.x == 0.0 && position.y == 0.0 && position.z == 0.0){    
-                                gl_PointSize = 0.0;
-                                return;
-                            }
-
-                            // mouse.x means timestamp
-                            float progress = clamp((timestamp - mouse.x) * speed , 0.0, 1.);
-
-                            vec3 startPosition = position;
-
-                            vec4 localCenter = inverseModelMatrix * vec4(position, 1.0);
-
-                            vec3 cPosition = vec3(mouse.y, mouse.z, mouse.w);
-                            cPosition = cPosition * 2.0 - 1.0;
-
-                            // mouse.y means random 0~1
-                            float theta = cPosition.x * PI2 - PI;
-
-                            float viewDependentRad = 1.0;
-                            float rad = viewDependentRad * spread * cPosition.y;
-
-                            float x = localCenter.x + rad * cos(theta);
-                            float y = localCenter.y + rad * sin(theta);
-                            float z = 0.0;
-
-                            vec4 endPosition4 = modelMatrix * vec4(vec3(x, y, z), 1.0);
-                            vec3 endPosition = endPosition4.xyz; 
-                            
-                            float positionProgress = cubicOut(progress * random);
-                            vec3 currentPosition = mix(startPosition, endPosition, positionProgress);
-
-                            float diff = 100.0; 
-
-                            vProgress = progress;
-                            vRandom = random;
-                            vDiff = diff;
-                            vSpreadLength = cPosition.y;
-                            vPositionZ = 1.0;
-
-                            gl_Position = czm_modelViewProjection * vec4(currentPosition, 1.0);;
-
-                            float factor = pow(progress, 0.1);
-                          
-                            gl_PointSize = max(size * diff * pixelRatio * factor , minSize * (pixelRatio > 1. ? 1.3 : 1.));
-                           // gl_PointSize = 10.0;
-                        }`;
-
-        const fs = `
-                        precision highp float;
-             
-                        in float vRandom;
-                        in float vProgress;
-                        in float vSpreadLength;
-                        in float vPositionZ;
-                        in float vDiff;
-
-                        uniform float fadeSpeed;
-                        uniform float shortRangeFadeSpeed;
-                        uniform float minFlashingSpeed;
-                        uniform float blur;
-                        
-                        highp float random(vec2 co) {
-                            highp float a = 12.9898;
-                            highp float b = 78.233;
-                            highp float c = 43758.5453;
-                            highp float dt = dot(co.xy, vec2(a, b));
-                            highp float sn = mod(dt, 3.14);
-
-                            return fract(sin(sn) * c);
-                        }
-
-                        float quadraticIn(float t) {
-                            return t * t;
-                        }
-
-                        #ifndef HALF_PI
-                        #define HALF_PI 1.5707963267948966
-                        #endif
-
-                        float sineOut(float t) {
-                            return sin(t * HALF_PI);
-                        }
-                       
-                        const vec3 baseColor = vec3(170., 133., 88.) / 255.;
-
-                        void main() {
-                            vec2 p = gl_PointCoord * 2. - 1.0;
-                            float len = length(p);
-
-                            float cRandom = random(vec2(vProgress * mix(minFlashingSpeed, 1., vRandom)));
-                            cRandom = mix(0.3, 2.0, cRandom);
-           
-                            float cBlur = blur * mix(1.0, 0.3, vPositionZ);
-                            float shape = smoothstep(1. - cBlur, 1. + cBlur, (1. - cBlur) / len);
-                            shape *= mix(0.5, 1.0, vRandom);
-
-                            if (shape == 0.0)  {
-                                discard;
-                            }
-
-                            float darkness = mix(0.1, 1., vPositionZ);
-                            float alphaProgress = vProgress * fadeSpeed * 50.0 * mix(2.5, 1., pow(vDiff, 0.6));
-                            alphaProgress *= mix(shortRangeFadeSpeed, 1., sineOut(vSpreadLength) * quadraticIn(vDiff));
-
-                            float alpha = 1. - min(alphaProgress, 1.);
-                            alpha *= cRandom * vDiff;
-
-                            out_FragColor = vec4(baseColor * darkness * cRandom, shape * alpha);
-
-                           // out_FragColor = vec4(1.0, 1.0, 0.0, shape * alpha);
-                        }`;
-
         const shaderProgram = ShaderProgram.fromCache({
             context: this._scene.context,
             vertexShaderSource: vs,
             fragmentShaderSource: fs,
             attributeLocations: {
                 position: 0,
-                mouse: 1,
-                aFront: 2,
-                random: 3
+                random: 1,
+                timestamp: 2
             }
         });
 
@@ -299,46 +302,44 @@ class Trail {
             shaderProgram: shaderProgram,
             uniformMap: {
                 pixelRatio: () => window.devicePixelRatio,
-                timestamp: () => this._timestamp,
-                size: () => 0.05,
+                sysTimestamp: () => this._sysTimestamp,
+                size: () => 2,
                 minSize: () => 1,
                 speed: () => 0.012,
                 fadeSpeed: () => 1.1,
                 shortRangeFadeSpeed: () => 1.3,
                 minFlashingSpeed: () => 0.1,
-                spread: () => 7,
+                spread: () => 5,
                 maxSpread: () => 5,
                 maxZ: () => 100,
                 blur: () => 1,
                 far: () => 10,
                 maxDiff: () => 100,
-                diffPow: () => 0.24,
-                modelMatrix: () => this._modelMatrix,
-                inverseModelMatrix: () => this._inverseModelMatrix
+                diffPow: () => 0.24
             },
             renderState: RenderState.fromCache({
                 blending: BlendingState.ADDITIVE_BLEND
             }),
             pass: Pass.OPAQUE,
-            primitiveType: PrimitiveType.POINTS
+            primitiveType: PrimitiveType.POINTS,
+            modelMatrix: this._modelMatrix
         });
     }
 
-    updatePosition(modelMatrix) {
-        const vertexArray = this._createVertexArray(modelMatrix);
+    update(frameState) {
+        if (this._update) {
+            this._update = false;
 
-        if (this._command) {
-            this._command.vertexArray = vertexArray;
-        } else {
+            if (this._command) {
+                this._command.vertexArray.destroy();
+                this._command.shaderProgram.destroy();
+            }
+
+            const vertexArray = this._createVertexArray();
+
             this._command = this._createDrawCommand(vertexArray);
         }
-    }
 
-    updateTimestamp(julianDate) {
-        this._timestamp = julianDate.secondsOfDay;
-    }
-
-    update(frameState) {
         if (!this._command) {
             return;
         }
